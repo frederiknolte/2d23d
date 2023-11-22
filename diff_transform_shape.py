@@ -1,11 +1,8 @@
-import os
-import io
 import time
 import torch
 import numpy as np
 from tqdm import tqdm
 import imageio
-from PIL import Image
 import torch.nn as nn
 import matplotlib
 import matplotlib.pyplot as plt
@@ -27,7 +24,7 @@ from pytorch3d.renderer import (
     RasterizationSettings, MeshRenderer, MeshRasterizer,
     PointLights, TexturesVertex,
 )
-from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency, mesh_edge_loss
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
 from renderer import LayeredShader
 import wandb
 from argparse import ArgumentParser
@@ -103,9 +100,21 @@ def render(renderer, mesh, cameras):
     return image_ref
 
 
-@torch.no_grad()
-def render_nograd(renderer, mesh, cameras):
-    return render(renderer, mesh, cameras)
+def plot(source_image, target_image, num_views):
+    # Plot objects from differen viewpoints
+    fig, axs = plt.subplots(nrows=num_views, ncols=2, sharex=True, sharey=True, squeeze=False)
+    fig.set_size_inches(8, num_views * 4)
+    axs[0, 0].set_title("Source")
+    axs[0, 1].set_title("Target")
+
+    for i in range(num_views):
+        axs[i, 0].imshow(source_image[i])
+        axs[i, 1].imshow(target_image[i])
+        axs[i, 0].axis("off")
+        axs[i, 1].axis("off")
+
+    plt.tight_layout()
+    plt.show()
 
 
 class Model(nn.Module):
@@ -149,16 +158,9 @@ class Model(nn.Module):
         rgb_loss = torch.sum((self.dimg - self.image_ref) ** 2, dim=[1, 2, 3]).mean()
         laplacian_loss = mesh_laplacian_smoothing(self.tmesh, method="uniform")
         normal_loss = mesh_normal_consistency(self.tmesh)
-        edge_loss = mesh_edge_loss(self.tmesh)
 
-        total_loss = rgb_loss + self.loss_weights['w_laplacian'] * laplacian_loss + self.loss_weights['w_normal'] * normal_loss + self.loss_weights['w_edge'] * edge_loss
-        losses = {
-            'loss/rgb_loss': rgb_loss,
-            'loss/laplacian_loss': laplacian_loss,
-            'loss/normal_loss': normal_loss,
-            'loss/edge_loss': edge_loss,
-        }
-        return total_loss, self.dimg, losses
+        loss = rgb_loss + self.loss_weights['w_laplacian'] * laplacian_loss + self.loss_weights['w_normal'] * normal_loss
+        return loss, self.dimg, rgb_loss
 
     def RT_loss(self):
         trans = Translate(self.translation_params, device=self.device)
@@ -177,55 +179,10 @@ class Model(nn.Module):
         self.tmesh = self.meshes.offset_verts(self.deform_verts)
 
 
-def plot(control_target_image, control_source_image, optimisation_target_image, optimisation_source_image, show=False):
-    max_num_views = max(control_target_image.shape[0], control_source_image.shape[0], optimisation_target_image.shape[0], optimisation_source_image.shape[0])
-    fig, axs = plt.subplots(nrows=4, ncols=max_num_views, squeeze=False)
-    fig.set_size_inches(max_num_views * 4, 8)
-    axs[0, 0].set_ylabel("Control Target")
-    axs[1, 0].set_ylabel("Control Source")
-    axs[2, 0].set_ylabel("Optimisation Target")
-    axs[3, 0].set_ylabel("Optimisation Source")
-
-    def hide_axes(ax):
-        ax.get_xaxis().set_visible(False)
-        ax.get_yaxis().set_ticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-
-    for i in range(control_target_image.shape[0]):
-        axs[0, i].imshow(control_target_image[i])
-        hide_axes(axs[0, i])
-
-    for i in range(control_source_image.shape[0]):
-        axs[1, i].imshow(control_source_image[i])
-        hide_axes(axs[1, i])
-
-    for i in range(optimisation_target_image.shape[0]):
-        axs[2, i].imshow(optimisation_target_image[i])
-        hide_axes(axs[2, i])
-
-    for i in range(optimisation_source_image.shape[0]):
-        axs[3, i].imshow(optimisation_source_image[i])
-        hide_axes(axs[3, i])
-
-    plt.tight_layout()
-    if show:
-        plt.show()
-    else:
-        with io.BytesIO() as buff:
-            fig.savefig(buff, format='raw')
-            buff.seek(0)
-            data = np.frombuffer(buff.getvalue(), dtype=np.uint8)
-        w, h = fig.canvas.get_width_height()
-        image = data.reshape((int(h), int(w), -1))
-        return image
-
-
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--w_laplacian', type=float, default=0.0)
     parser.add_argument('--w_normal', type=float, default=0.0)
-    parser.add_argument('--w_edge', type=float, default=0.0)
     parser.add_argument('--sigma', type=float, default=1e-4)
     parse_config = parser.parse_args()
 
@@ -237,38 +194,29 @@ if __name__ == '__main__':
         'num_iter': 500,
         'learning_rate': 0.002,
         'num_views': 1,
-        'num_control_views': 1,
         'image_size': 128,
-        'control_image_size': 128,
         'faces_per_pixel': 150,
-        'control_faces_per_pixel': 150,
         'sigma': parse_config.sigma,
-        'control_sigma': 1e-4,
         'log_every': 10,
         'loss_weights': {
             'w_laplacian': parse_config.w_laplacian,
             'w_normal': parse_config.w_normal,
-            'w_edge': parse_config.w_edge
         }
     }
 
     assert config['optimisation'] in ['RT', 'shape']
-    assert config['num_control_views'] > 0
 
     # Initialise wandb
+    import sys
+    print(sys.path)
     wandb.init(
         project='2d23d',
         entity='frederiknolte',
         config=config,
         mode='online',
-        settings=wandb.Settings(start_method="fork"),
     )
 
-    if wandb.run.sweep_id is not None:
-        os.makedirs(f'./output/{wandb.run.sweep_id}', exist_ok=True)
-        filename_output = f'./output/{wandb.run.sweep_id}/{wandb.run.id}.mp4'
-    else:
-        filename_output = f'./output/{wandb.run.id}.mp4'
+    filename_output = f'./output/{wandb.run.id}.mp4'
 
     # Load objects and initialise renderer
     source_mesh = load_object(config['source_object_path'])
@@ -278,18 +226,17 @@ if __name__ == '__main__':
                                             image_size=config['image_size'],
                                             sigma=config['sigma'],
                                             faces_per_pixel=config['faces_per_pixel'])
-    control_renderer, control_cameras = initialise_renderer(num_views=config['num_control_views'],
-                                                            image_size=config['control_image_size'],
-                                                            sigma=config['control_sigma'],
-                                                            faces_per_pixel=config['control_faces_per_pixel'])
 
-    control_target_image = render_nograd(control_renderer, target_mesh, control_cameras).cpu().numpy()
-    optimisation_target_image = render_nograd(renderer, target_mesh, cameras).cpu().numpy()
+    target_image_ref = render(renderer, target_mesh, cameras).cpu().numpy()
+    source_image_ref = render(renderer, source_mesh, cameras).cpu().numpy()
+
+    # Plot objects from differen viewpoints
+    plot(source_image_ref, target_image_ref, config['num_views'])
 
     # Initialize a model using the renderer, mesh and reference image
     model = Model(meshes=source_mesh,
                   renderer=renderer,
-                  image_ref=torch.from_numpy(optimisation_target_image),
+                  image_ref=torch.tensor(target_image_ref),
                   cameras=cameras,
                   optimisation=config["optimisation"],
                   loss_weights=config['loss_weights']).to(device)
@@ -297,44 +244,44 @@ if __name__ == '__main__':
     # Create an optimizer. Here we are using Adam and we pass in the parameters of the model
     optimizer = torch.optim.Adam(model.parameters(), lr=config['learning_rate'])
 
-    total_loss, dimg, _ = model()
-    control_source_image = render_nograd(control_renderer, model.tmesh, control_cameras).cpu().numpy()
-    plot(control_target_image, control_source_image, optimisation_target_image, dimg.detach().cpu().numpy(), show=True)
+    loss, dimg, _ = model()
+    plot(dimg.detach().cpu().numpy(), target_image_ref, config['num_views'])
 
     # Optimisation loop
     loop = tqdm(range(config['num_iter']))
-    flattened_target = np.concatenate(list(control_target_image * 255.), axis=1).astype(np.uint8)
+    flattened_target = np.concatenate(list(target_image_ref * 255.), axis=1).astype(np.uint8)
     writer = imageio.get_writer(filename_output, format="mp4", mode="I", fps=10)
     total_time = 0
     for i in loop:
         step_start_time = time.time()
         optimizer.zero_grad()
-        total_loss, dimg, losses = model()
-        total_loss.backward()
+        loss, dimg, rgb_loss = model()
+        loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         step_finish_time = time.time()
         step_time = step_finish_time - step_start_time
         total_time += step_time
 
-        loop.set_description('Optimizing (loss %.4f)' % total_loss.data)
+        loop.set_description('Optimizing (loss %.4f)' % loss.data)
 
         # Save outputs to create an mp4.
-        optimisation_source_image = dimg.detach().cpu().numpy()
-        control_source_image = render_nograd(control_renderer, model.tmesh, control_cameras).cpu().numpy()
-        image = plot(control_target_image, control_source_image, optimisation_target_image, optimisation_source_image)
+        image = img_as_ubyte(dimg.detach().cpu().numpy())
+        image = np.concatenate(list(image), axis=1)
+        image = np.concatenate([flattened_target, image], axis=0)
         writer.append_data(image)
 
         if i % config['log_every'] == 0 or i == (config['num_iter'] - 1):
-            log = losses
-            log['loss/total_loss'] = total_loss.item()
-            log['total_time'] = total_time
-            log['step_time'] = step_time
-            log['rendering'] = wandb.Image(image)
-            log['step'] = i
-            wandb.log(log)
+            wandb.log({
+                'total_time': total_time,
+                'step_time': step_time,
+                'loss': loss.item(),
+                'rgb_loss': rgb_loss.item(),
+                'rendering': wandb.Image(image),
+                'step': i
+            })
 
-    plot(control_target_image, control_source_image, optimisation_target_image, optimisation_source_image, show=True)
+    plot(dimg.detach().cpu().numpy(), target_image_ref, config['num_views'])
 
     writer.close()
     wandb.finish()
